@@ -288,6 +288,12 @@ class PG_SharedProperties(PropertyGroup):
         default=False,
     )
 
+    makeSingleUserCopy: BoolProperty(
+        name="Make Single User Copy",
+        description="If multiple selected objects share the same mesh data, make each one a unique single-user copy before unwrapping. Disable this to unwrap shared mesh data in place without duplicating it - in that case each unique mesh is only unwrapped once (the first object using it), since the UVs are shared by all objects linked to that mesh. Note: this dedup only applies within a single unwrap run, so it has no effect when combined with 'Individual Atlas Per Object', which unwraps one object at a time.",
+        default=True,
+    )
+
     individualAtlasPerObject: BoolProperty(
         name="Individual Atlas Per Object",
         description="Each object will be unwrapped separately using the full atlas space. Useful for exporting to game engines.",
@@ -374,14 +380,25 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
         rename_dict = dict()
         safe_dict = dict()
 
+        seen_mesh_data = set()
+        skipped_objects = []
+
         # make sure all the objects have lightmap uvs
         for obj in selected_objects:
             if obj.type == "MESH":
+                if not sharedProperties.makeSingleUserCopy:
+                    if obj.data.users > 1:
+                        if obj.data.name in seen_mesh_data:
+                            skipped_objects.append(obj)
+                            obj.select_set(False)
+                            continue
+                        seen_mesh_data.add(obj.data.name)
+
                 safe_name = gen_safe_name()
                 rename_dict[obj.name] = (obj.name, safe_name)
                 safe_dict[safe_name] = obj.name
                 context.view_layer.objects.active = obj
-                if obj.data.users > 1:
+                if sharedProperties.makeSingleUserCopy and obj.data.users > 1:
                     obj.data = obj.data.copy()
                 uv_layers = obj.data.uv_layers
 
@@ -400,6 +417,14 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                         if uv_layers[i].name == uvName:
                             uv_layers.active_index = i
                 obj.select_set(True)
+
+        if skipped_objects:
+            skipped_names = ", ".join(o.name for o in skipped_objects)
+            print(
+                f"Skipped {len(skipped_objects)} object(s) sharing already-unwrapped mesh data: {skipped_names}"
+            )
+
+        selected_objects = bpy.context.selected_objects
 
         # save all the current edges (pack-only mode)
         if sharedProperties.packOnly:
@@ -804,6 +829,8 @@ class OBJECT_PT_run_panel(Panel):
         row.prop(scene.shared_properties, "packOnly")
         row = box.row()
         row.prop(scene.shared_properties, "individualAtlasPerObject")
+        row = box.row()
+        row.prop(scene.shared_properties, "makeSingleUserCopy")
 
 
 # end panels------------------------------
