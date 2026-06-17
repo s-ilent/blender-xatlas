@@ -440,7 +440,12 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
             export_materials=False,
             export_triangulated_mesh=False,
             export_curves_as_nurbs=False,
-            export_object_groups=True,
+            # export_object_groups writes "o" lines as
+            # "<Collection><separator><ObjectName>" rather than the bare
+            # object name, which breaks the name lookup when mapping
+            # xatlas's output back onto scene objects. Keep this off so
+            # each "o" line is exactly the object name.
+            export_object_groups=False,
             export_material_groups=False,
             export_vertex_groups=False,
             export_smooth_groups=False,
@@ -567,11 +572,41 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
 
             # resolve name: xatlas returns the object name from the OBJ "o" token.
             # Try safe_dict first (in case names were mapped), then use as-is.
-            obTest.obName = safe_dict.get(obTest.obName, obTest.obName)
+            raw_name = obTest.obName
+            resolved = safe_dict.get(raw_name, raw_name)
+
+            if resolved not in bpy.context.scene.objects:
+                # some Blender OBJ export settings prefix or
+                # suffix the "o" name with extra hierarchy/data info, e.g.
+                # "CollectionName_ObjectName" or "ObjectName_MeshDataName".
+                # Try stripping at each separator and matching either the
+                # prefix or the suffix against known selected object names.
+                candidate = None
+                for sep in ("_", "/", "."):
+                    if sep in raw_name:
+                        parts = raw_name.split(sep)
+                        suffix = parts[-1]
+                        prefix = parts[0]
+                        if suffix in bpy.context.scene.objects:
+                            candidate = suffix
+                            break
+                        if prefix in bpy.context.scene.objects:
+                            candidate = prefix
+                            break
+                # Also try: does any selected object's name appear as a
+                # leading or trailing substring of raw_name?
+                if candidate is None:
+                    for obj_name in safe_dict.values():
+                        if raw_name.startswith(obj_name) or raw_name.endswith(obj_name):
+                            candidate = obj_name
+                            break
+                resolved = candidate if candidate else resolved
+
+            obTest.obName = resolved
 
             if obTest.obName not in bpy.context.scene.objects:
                 print(
-                    f"Warning: object '{obTest.obName}' not found in scene, skipping."
+                    f"Warning: object '{raw_name}' (resolved: '{obTest.obName}') not found in scene, skipping."
                 )
                 continue
 
