@@ -69,21 +69,13 @@ from bpy.utils import register_class, unregister_class
 addon_name = __name__
 
 
-# ---------------------------------------------------------------------------
-# Helper: return the bpy.props annotation keys for a PropertyGroup instance.
-#
-# Python 3.13 (Blender 5.1) adopted PEP 649 lazy annotations, so accessing
-# __annotations__ on an *instance* no longer works — it must be accessed on
-# the *class*.  We also fall back to bl_rna.properties for robustness.
-# ---------------------------------------------------------------------------
+# Python 3.13 (Blender 5.1) uses lazy annotations, so __annotations__ on an
+# instance no longer works - use the class instead, with bl_rna as fallback.
 def _prop_keys(pg_instance):
-    """Return an iterable of property names defined on a PropertyGroup."""
     cls = type(pg_instance)
-    # Preferred: class-level __annotations__ populated by bpy.props decorators.
     ann = getattr(cls, "__annotations__", None)
     if ann:
         return list(ann.keys())
-    # Fallback: iterate bl_rna.properties, skipping the built-in 'rna_type'.
     return [
         p.identifier
         for p in pg_instance.bl_rna.properties
@@ -290,7 +282,7 @@ class PG_SharedProperties(PropertyGroup):
 
     makeSingleUserCopy: BoolProperty(
         name="Make Single User Copy",
-        description="If multiple selected objects share the same mesh data, make each one a unique single-user copy before unwrapping. Disable this to unwrap shared mesh data in place without duplicating it - in that case each unique mesh is only unwrapped once (the first object using it), since the UVs are shared by all objects linked to that mesh. Note: this dedup only applies within a single unwrap run, so it has no effect when combined with 'Individual Atlas Per Object', which unwraps one object at a time.",
+        description="Make shared mesh data single-user before unwrapping. If off, shared meshes are only unwrapped once.",
         default=True,
     )
 
@@ -340,7 +332,17 @@ class Setup_Unwrap(bpy.types.Operator):
             selected_objects = bpy.context.selected_objects
 
         if sharedProperties.individualAtlasPerObject:
+            # dedup shared mesh data across the batch
+            seen_mesh_data = set()
             for obj in selected_objects:
+                if obj.type == "MESH" and not sharedProperties.makeSingleUserCopy:
+                    if obj.data.users > 1 and obj.data.name in seen_mesh_data:
+                        print(
+                            f"Skipping '{obj.name}', shares mesh data with an already-unwrapped object"
+                        )
+                        continue
+                    seen_mesh_data.add(obj.data.name)
+
                 bpy.ops.object.select_all(action="DESELECT")
                 obj.select_set(True)
                 context.view_layer.objects.active = obj
@@ -380,6 +382,10 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
         rename_dict = dict()
         safe_dict = dict()
 
+        # remember original active UV index to restore later
+        original_active_uv = dict()
+
+        # dedup shared mesh data when makeSingleUserCopy is off
         seen_mesh_data = set()
         skipped_objects = []
 
@@ -389,6 +395,7 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                 if not sharedProperties.makeSingleUserCopy:
                     if obj.data.users > 1:
                         if obj.data.name in seen_mesh_data:
+                            # already unwrapped this mesh data
                             skipped_objects.append(obj)
                             obj.select_set(False)
                             continue
@@ -401,6 +408,10 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                 if sharedProperties.makeSingleUserCopy and obj.data.users > 1:
                     obj.data = obj.data.copy()
                 uv_layers = obj.data.uv_layers
+
+                # keyed by mesh data name so shared data records once
+                if obj.data.name not in original_active_uv:
+                    original_active_uv[obj.data.name] = uv_layers.active_index
 
                 uvName = "UVMap_Lightmap"
                 if sharedProperties.lightmapUVChoiceType == "NAME":
@@ -417,6 +428,14 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                         if uv_layers[i].name == uvName:
                             uv_layers.active_index = i
                 obj.select_set(True)
+            else:
+                # deselect non-mesh objects, can't triangulate/export them
+                obj.select_set(False)
+
+        # re-point active object if it got deselected above
+        remaining = [o for o in bpy.context.selected_objects if o.type == "MESH"]
+        if remaining and context.view_layer.objects.active not in remaining:
+            context.view_layer.objects.active = remaining[0]
 
         if skipped_objects:
             skipped_names = ", ".join(o.name for o in skipped_objects)
@@ -425,6 +444,10 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
             )
 
         selected_objects = bpy.context.selected_objects
+
+        if len(selected_objects) == 0:
+            print("Nothing left to unwrap")
+            return {"FINISHED"}
 
         # save all the current edges (pack-only mode)
         if sharedProperties.packOnly:
@@ -444,13 +467,7 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
         bpy.ops.mesh.quads_convert_to_tris(quad_method="FIXED", ngon_method="BEAUTY")
         bpy.ops.object.mode_set(mode="OBJECT")
 
-        # -----------------------------------------------------------------------
-        # OBJ export — Blender 5.x requires a real file path.
-        # The exact parameter names come from the 5.1 API docs for wm.obj_export:
-        #   export_selected_objects, export_uv, export_normals, export_materials,
-        #   export_triangulated_mesh, export_object_groups, apply_modifiers,
-        #   export_eval_mode.
-        # -----------------------------------------------------------------------
+        # export to a real temp file, Blender 5.x needs a real filepath
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".obj")
         os.close(tmp_fd)
 
@@ -465,12 +482,7 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
             export_materials=False,
             export_triangulated_mesh=False,
             export_curves_as_nurbs=False,
-            # export_object_groups writes "o" lines as
-            # "<Collection><separator><ObjectName>" rather than the bare
-            # object name, which breaks the name lookup when mapping
-            # xatlas's output back onto scene objects. Keep this off so
-            # each "o" line is exactly the object name.
-            export_object_groups=False,
+            export_object_groups=False,  # keep "o" names as bare object names
             export_material_groups=False,
             export_vertex_groups=False,
             export_smooth_groups=False,
@@ -595,17 +607,12 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
             bpy.ops.object.select_all(action="DESELECT")
             obTest = importObject
 
-            # resolve name: xatlas returns the object name from the OBJ "o" token.
-            # Try safe_dict first (in case names were mapped), then use as-is.
+            # resolve xatlas's "o" name back to the scene object
             raw_name = obTest.obName
             resolved = safe_dict.get(raw_name, raw_name)
 
             if resolved not in bpy.context.scene.objects:
-                # some Blender OBJ export settings prefix or
-                # suffix the "o" name with extra hierarchy/data info, e.g.
-                # "CollectionName_ObjectName" or "ObjectName_MeshDataName".
-                # Try stripping at each separator and matching either the
-                # prefix or the suffix against known selected object names.
+                # fallback: try stripping prefix/suffix decorations
                 candidate = None
                 for sep in ("_", "/", "."):
                     if sep in raw_name:
@@ -618,8 +625,6 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                         if prefix in bpy.context.scene.objects:
                             candidate = prefix
                             break
-                # Also try: does any selected object's name appear as a
-                # leading or trailing substring of raw_name?
                 if candidate is None:
                     for obj_name in safe_dict.values():
                         if raw_name.startswith(obj_name) or raw_name.endswith(obj_name):
@@ -664,6 +669,12 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                 )
 
             bm.to_mesh(me)
+            bm.free()
+
+            # restore original active UV map
+            original_index = original_active_uv.get(me.name)
+            if original_index is not None and 0 <= original_index < len(me.uv_layers):
+                me.uv_layers.active_index = original_index
 
         # restore quads in pack-only mode
         if sharedProperties.packOnly:
@@ -747,7 +758,7 @@ class OBJECT_PT_pack_panel(Panel):
         packtool = scene.pack_tool
 
         box = layout.box()
-        # Use _prop_keys() — works with Python 3.13 deferred annotations
+
         for tool in _prop_keys(packtool):
             box.prop(packtool, tool)
 
@@ -771,7 +782,7 @@ class OBJECT_PT_chart_panel(Panel):
         mytool = scene.chart_tool
 
         box = layout.box()
-        # Use _prop_keys() — works with Python 3.13 deferred annotations
+
         for tool in _prop_keys(mytool):
             box.prop(mytool, tool)
 
@@ -834,7 +845,6 @@ class OBJECT_PT_run_panel(Panel):
 
 
 # end panels------------------------------
-
 
 # begin setup------------------------------
 
