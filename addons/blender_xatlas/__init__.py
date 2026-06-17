@@ -11,29 +11,24 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import importlib
 import os
-import sys
-import bpy
-import bmesh
 import platform
-
-from dataclasses import dataclass
-from dataclasses import field
+import string
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import uuid
+from dataclasses import dataclass, field
+from io import StringIO
+from queue import Empty, Queue
+from threading import Thread
 from typing import List
 
-from io import StringIO
-import struct
-
-import subprocess
-import threading
-from threading import Thread
-from queue import Queue, Empty
-import string
-
-import uuid
-
-
-import importlib
+import bmesh
+import bpy
 
 bl_info = {
     "name": "Blender Xatlas",
@@ -41,8 +36,8 @@ bl_info = {
     "author": "mattedickson",
     "wiki_url": "https://github.com/mattedicksoncom/blender-xatlas/",
     "tracker_url": "https://github.com/mattedicksoncom/blender-xatlas/issues",
-    "version": (0, 0, 13),
-    "blender": (4, 0, 0),
+    "version": (0, 0, 14),
+    "blender": (5, 1, 0),
     "location": "3D View > Toolbox",
     "category": "Object",
 }
@@ -54,29 +49,50 @@ if type(__safe_path__) == list:
 
 sys.path.append(__safe_path__)
 
-from bpy.utils import register_class, unregister_class
 from bpy.props import (
-    StringProperty,
     BoolProperty,
-    IntProperty,
+    EnumProperty,
     FloatProperty,
     FloatVectorProperty,
-    EnumProperty,
+    IntProperty,
     PointerProperty,
+    StringProperty,
 )
 from bpy.types import (
-    Panel,
     AddonPreferences,
     Operator,
+    Panel,
     PropertyGroup,
 )
+from bpy.utils import register_class, unregister_class
 
 addon_name = __name__
 
 
+# ---------------------------------------------------------------------------
+# Helper: return the bpy.props annotation keys for a PropertyGroup instance.
+#
+# Python 3.13 (Blender 5.1) adopted PEP 649 lazy annotations, so accessing
+# __annotations__ on an *instance* no longer works — it must be accessed on
+# the *class*.  We also fall back to bl_rna.properties for robustness.
+# ---------------------------------------------------------------------------
+def _prop_keys(pg_instance):
+    """Return an iterable of property names defined on a PropertyGroup."""
+    cls = type(pg_instance)
+    # Preferred: class-level __annotations__ populated by bpy.props decorators.
+    ann = getattr(cls, "__annotations__", None)
+    if ann:
+        return list(ann.keys())
+    # Fallback: iterate bl_rna.properties, skipping the built-in 'rna_type'.
+    return [
+        p.identifier
+        for p in pg_instance.bl_rna.properties
+        if p.identifier != "rna_type"
+    ]
+
+
 # begin PropertyGroups---------------------------
 class PG_PackProperties(PropertyGroup):
-
     bruteForce: BoolProperty(
         name="Brute Force",
         description="Slower, but gives the best result. If false, use random chart placement.",
@@ -129,7 +145,6 @@ class PG_PackProperties(PropertyGroup):
 
 
 class PG_ChartProperties(PropertyGroup):
-
     maxChartArea: FloatProperty(
         name="maxChartArea",
         description="Don't grow charts to be larger than this. 0 means no limit.",
@@ -145,7 +160,6 @@ class PG_ChartProperties(PropertyGroup):
         max=10000.0,
     )
 
-    # Weights determine chart growth. Higher weights mean higher cost for that metric.
     normalDeviationWeight: FloatProperty(
         name="normalDeviationWeight",
         description="Angle between face and average chart normal.",
@@ -200,12 +214,10 @@ def get_collectionNames(self, context):
 
 def gen_safe_name():
     genId = uuid.uuid4().hex
-    # genId = "u_" + genId.replace("-","_")
     return "u_" + genId
 
 
 class PG_SharedProperties(PropertyGroup):
-
     unwrapSelection: EnumProperty(
         name="",
         description="Which Objects to unwrap",
@@ -294,7 +306,6 @@ class Setup_Unwrap(bpy.types.Operator):
 
     def execute(self, context):
         sharedProperties = bpy.context.scene.shared_properties
-        # sharedProperties.unwrapSelection
 
         # save whatever mode the user was in
         startingMode = bpy.context.object.mode
@@ -316,7 +327,6 @@ class Setup_Unwrap(bpy.types.Operator):
         elif sharedProperties.unwrapSelection == "COLLECTION":
             bpy.ops.object.select_all(action="DESELECT")
             for collection in bpy.data.collections:
-                # print(collection.name)
                 if collection.name == sharedProperties.selectedCollection:
                     for current_object in collection.all_objects:
                         if current_object.type == "MESH":
@@ -332,13 +342,12 @@ class Setup_Unwrap(bpy.types.Operator):
         else:
             Unwrap_Lightmap_Group_Xatlas_2.execute(self, context)
 
-        # reset everything--------------------------------------------
+        # reset everything
         bpy.ops.object.select_all(action="DESELECT")
         for objects in startingSelection:
             objects.select_set(True)
         context.view_layer.objects.active = startingActiveObject
         bpy.ops.object.mode_set(mode=startingMode)
-        # bpy.context.selected_objects = startingSelection
 
         return {"FINISHED"}
 
@@ -350,32 +359,22 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        # will attempt to run on all selected objects
-        # it is up to something else to do that selecting
-
-        # get all the options for xatlas
         packOptions = bpy.context.scene.pack_tool
         chartOptions = bpy.context.scene.chart_tool
-
         sharedProperties = bpy.context.scene.shared_properties
-        # sharedProperties.unwrapSelection
 
-        # save whatever mode the user was in
         startingMode = bpy.context.object.mode
         selected_objects = bpy.context.selected_objects
 
-        # check something is actually selected
-        # external function/operator will select them
         if len(selected_objects) == 0:
             print("Nothing Selected")
             self.report({"WARNING"}, "Nothing Selected, please select Something")
             return {"FINISHED"}
 
-        # store the names of objects to be lightmapped
         rename_dict = dict()
         safe_dict = dict()
 
-        # make sure all the objects have ligthmap uvs
+        # make sure all the objects have lightmap uvs
         for obj in selected_objects:
             if obj.type == "MESH":
                 safe_name = gen_safe_name()
@@ -383,10 +382,9 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                 safe_dict[safe_name] = obj.name
                 context.view_layer.objects.active = obj
                 if obj.data.users > 1:
-                    obj.data = obj.data.copy()  # make single user copy
+                    obj.data = obj.data.copy()
                 uv_layers = obj.data.uv_layers
 
-                # setup the lightmap uvs
                 uvName = "UVMap_Lightmap"
                 if sharedProperties.lightmapUVChoiceType == "NAME":
                     uvName = sharedProperties.lightmapUVName
@@ -394,7 +392,7 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                     if sharedProperties.lightmapUVIndex < len(uv_layers):
                         uvName = uv_layers[sharedProperties.lightmapUVIndex].name
 
-                if not uvName in uv_layers:
+                if uvName not in uv_layers:
                     uvmap = uv_layers.new(name=uvName)
                     uv_layers.active_index = len(uv_layers) - 1
                 else:
@@ -403,7 +401,7 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                             uv_layers.active_index = i
                 obj.select_set(True)
 
-        # save all the current edges
+        # save all the current edges (pack-only mode)
         if sharedProperties.packOnly:
             edgeDict = dict()
             for obj in selected_objects:
@@ -413,54 +411,49 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                     tempEdgeDict["edges"] = []
                     print(len(obj.data.edges))
                     for i in range(0, len(obj.data.edges)):
-                        setEdge = obj.data.edges[i]
                         tempEdgeDict["edges"].append(i)
                     edgeDict[obj.name] = tempEdgeDict
 
-            bpy.ops.object.mode_set(mode="EDIT")
-            bpy.ops.mesh.select_all(action="SELECT")
-            bpy.ops.mesh.quads_convert_to_tris(
-                quad_method="FIXED", ngon_method="BEAUTY"
-            )
-        else:
-            bpy.ops.object.mode_set(mode="EDIT")
-            bpy.ops.mesh.select_all(action="SELECT")
-            bpy.ops.mesh.quads_convert_to_tris(
-                quad_method="FIXED", ngon_method="BEAUTY"
-            )
-
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_all(action="SELECT")
+        bpy.ops.mesh.quads_convert_to_tris(quad_method="FIXED", ngon_method="BEAUTY")
         bpy.ops.object.mode_set(mode="OBJECT")
 
-        # Create a fake obj export to a string
-        # Will strip this down further later
-        fakeFile = StringIO()
+        # -----------------------------------------------------------------------
+        # OBJ export — Blender 5.x requires a real file path.
+        # The exact parameter names come from the 5.1 API docs for wm.obj_export:
+        #   export_selected_objects, export_uv, export_normals, export_materials,
+        #   export_triangulated_mesh, export_object_groups, apply_modifiers,
+        #   export_eval_mode.
+        # -----------------------------------------------------------------------
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".obj")
+        os.close(tmp_fd)
+
         bpy.ops.wm.obj_export(
-            rename_dict=rename_dict,
-            context=bpy.context,
-            filepath=fakeFile,
-            mainUVChoiceType=sharedProperties.mainUVChoiceType,
-            uvIndex=sharedProperties.mainUVIndex,
-            uvName=sharedProperties.mainUVName,
-            use_selection=True,
-            use_animation=False,
-            use_mesh_modifiers=True,
-            use_edges=True,
-            use_smooth_groups=False,
-            use_smooth_groups_bitflags=False,
-            use_normals=True,
-            use_uvs=True,
-            use_materials=False,
-            use_triangles=False,
-            use_nurbs=False,
-            use_vertex_groups=False,
-            use_blen_objects=True,
-            group_by_object=False,
-            group_by_material=False,
-            keep_vertex_order=True,
+            filepath=tmp_path,
+            export_animation=False,
+            apply_modifiers=True,
+            export_eval_mode="DAG_EVAL_VIEWPORT",
+            export_selected_objects=True,
+            export_uv=True,
+            export_normals=True,
+            export_materials=False,
+            export_triangulated_mesh=False,
+            export_curves_as_nurbs=False,
+            export_object_groups=True,
+            export_material_groups=False,
+            export_vertex_groups=False,
+            export_smooth_groups=False,
+            smooth_group_bitflags=False,
         )
 
-        # print just for reference
-        # print(fakeFile.getvalue())
+        with open(tmp_path, "r") as f:
+            fakeFile_value = f.read()
+
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
         # get the path to xatlas
         file_path = os.path.dirname(os.path.abspath(__file__))
@@ -468,50 +461,35 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
             xatlas_path = os.path.join(file_path, "xatlas", "xatlas-blender.exe")
         elif platform.system() == "Linux":
             xatlas_path = os.path.join(file_path, "xatlas", "xatlas-blender")
-            # need to set permissions for the process on linux
             subprocess.Popen('chmod u+x "' + xatlas_path + '"', shell=True)
         elif platform.system() == "Darwin":
             xatlas_path = os.path.join(file_path, "xatlas", "xatlas-blender")
-            # need to set permissions for the process on osx
             subprocess.Popen('chmod u+x "' + xatlas_path + '"', shell=True)
-        # setup the arguments to be passed to xatlas-------------------
+
+        # build xatlas argument string using _prop_keys() for Py 3.13 compat
         arguments_string = ""
-        for argumentKey in packOptions.__annotations__.keys():
-            key_string = str(argumentKey)
-            if argumentKey is not None:
-                print(getattr(packOptions, key_string))
-                attrib = getattr(packOptions, key_string)
-                if type(attrib) == bool:
-                    if attrib == True:
-                        arguments_string = arguments_string + " -" + str(argumentKey)
-                else:
-                    arguments_string = (
-                        arguments_string + " -" + str(argumentKey) + " " + str(attrib)
-                    )
+        for argumentKey in _prop_keys(packOptions):
+            attrib = getattr(packOptions, argumentKey)
+            if type(attrib) == bool:
+                if attrib:
+                    arguments_string += " -" + argumentKey
+            else:
+                arguments_string += " -" + argumentKey + " " + str(attrib)
 
-        for argumentKey in chartOptions.__annotations__.keys():
-            if argumentKey is not None:
-                key_string = str(argumentKey)
-                print(getattr(chartOptions, key_string))
-                attrib = getattr(chartOptions, key_string)
-                if type(attrib) == bool:
-                    if attrib == True:
-                        arguments_string = arguments_string + " -" + str(argumentKey)
-                else:
-                    arguments_string = (
-                        arguments_string + " -" + str(argumentKey) + " " + str(attrib)
-                    )
+        for argumentKey in _prop_keys(chartOptions):
+            attrib = getattr(chartOptions, argumentKey)
+            if type(attrib) == bool:
+                if attrib:
+                    arguments_string += " -" + argumentKey
+            else:
+                arguments_string += " -" + argumentKey + " " + str(attrib)
 
-        # add pack only option
         if sharedProperties.packOnly:
-            arguments_string = arguments_string + " -packOnly"
+            arguments_string += " -packOnly"
 
-        arguments_string = (
-            arguments_string + " -atlasLayout" + " " + sharedProperties.atlasLayout
-        )
+        arguments_string += " -atlasLayout " + sharedProperties.atlasLayout
 
         print(arguments_string)
-        # END setup the arguments to be passed to xatlas-------------------
 
         # RUN xatlas process
         xatlas_process = subprocess.Popen(
@@ -521,26 +499,19 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
             shell=True,
         )
 
-        # shove the fake file in stdin
         stdin = xatlas_process.stdin
-        value = bytes(
-            fakeFile.getvalue() + "\n", "UTF-8"
-        )  # The \n is needed to end the input properly
+        value = bytes(fakeFile_value + "\n", "UTF-8")
         stdin.write(value)
         stdin.flush()
 
-        # Get the output from xatlas
         outObj = ""
         while True:
             output = xatlas_process.stdout.readline()
             if not output:
                 break
-            outObj = outObj + (output.decode().strip() + "\n")
+            outObj += output.decode().strip() + "\n"
 
-        # the objects after xatlas processing
-        # print(outObj)
-
-        # Setup for reading the output
+        # parse xatlas output
         @dataclass
         class uvObject:
             obName: string = ""
@@ -550,48 +521,34 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
         convertedObjects = []
         uvArrayComplete = []
 
-        # search through the out put for STARTOBJ
-        # then start reading the objects
         obTest = None
         startRead = False
         for line in outObj.splitlines():
-
             line_split = line.split()
-
             if not line_split:
                 continue
+            line_start = line_split[0]
 
-            line_start = line_split[0]  # we compare with this a _lot_
-            # print(line_start)
             if line_start == "STARTOBJ":
                 print(
                     "Start reading the objects----------------------------------------"
                 )
                 startRead = True
-                # obTest = uvObject()
 
             if startRead:
-                # if it's a new obj
                 if line_start == "o":
-                    # if there is already an object append it
                     if obTest is not None:
                         convertedObjects.append(obTest)
-
-                    obTest = uvObject()  # create new uv object
+                    obTest = uvObject()
                     obTest.obName = line_split[1]
 
                 if obTest is not None:
-                    # the uv coords
                     if line_start == "vt":
                         newUv = [float(line_split[1]), float(line_split[2])]
                         obTest.uvArray.append(newUv)
                         uvArrayComplete.append(newUv)
 
-                    # the face coords index
-                    # faces are 1 indexed
                     if line_start == "f":
-                        # vert/uv/normal
-                        # only need the uvs
                         newFace = [
                             int(line_split[1].split("/")[1]),
                             int(line_split[2].split("/")[1]),
@@ -599,66 +556,56 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                         ]
                         obTest.faceArray.append(newFace)
 
-        # append the final object
-        convertedObjects.append(obTest)
-        # print(convertedObjects)
+        if obTest is not None:
+            convertedObjects.append(obTest)
 
-        # apply the output-------------------------------------------------------------
-        # copy the uvs to the original objects
-        # objIndex = 0
+        # apply the UVs back to the scene objects
         print("Applying the UVs----------------------------------------")
-        # print(convertedObjects)
         for importObject in convertedObjects:
             bpy.ops.object.select_all(action="DESELECT")
-
             obTest = importObject
-            obTest.obName = safe_dict[
-                obTest.obName
-            ]  # probably shouldn't just replace it
+
+            # resolve name: xatlas returns the object name from the OBJ "o" token.
+            # Try safe_dict first (in case names were mapped), then use as-is.
+            obTest.obName = safe_dict.get(obTest.obName, obTest.obName)
+
+            if obTest.obName not in bpy.context.scene.objects:
+                print(
+                    f"Warning: object '{obTest.obName}' not found in scene, skipping."
+                )
+                continue
+
             bpy.context.scene.objects[obTest.obName].select_set(True)
             context.view_layer.objects.active = bpy.context.scene.objects[obTest.obName]
             bpy.ops.object.mode_set(mode="OBJECT")
 
             obj = bpy.context.active_object
             me = obj.data
-            # convert to bmesh to create the new uvs
             bm = bmesh.new()
             bm.from_mesh(me)
-
             uv_layer = bm.loops.layers.uv.verify()
-
             nFaces = len(bm.faces)
-            # need to ensure lookup table for some reason?
             if hasattr(bm.faces, "ensure_lookup_table"):
                 bm.faces.ensure_lookup_table()
 
-            # loop through the faces
             for faceIndex in range(nFaces):
                 faceGroup = obTest.faceArray[faceIndex]
-
                 bm.faces[faceIndex].loops[0][uv_layer].uv = (
                     uvArrayComplete[faceGroup[0] - 1][0],
                     uvArrayComplete[faceGroup[0] - 1][1],
                 )
-
                 bm.faces[faceIndex].loops[1][uv_layer].uv = (
                     uvArrayComplete[faceGroup[1] - 1][0],
                     uvArrayComplete[faceGroup[1] - 1][1],
                 )
-
                 bm.faces[faceIndex].loops[2][uv_layer].uv = (
                     uvArrayComplete[faceGroup[2] - 1][0],
                     uvArrayComplete[faceGroup[2] - 1][1],
                 )
 
-                # objIndex = objIndex + 3
-
-            # print(objIndex)
-            # assign the mesh back to the original mesh
             bm.to_mesh(me)
-        # END apply the output-------------------------------------------------------------
 
-        # Start setting the quads back again-------------------------------------------------------------
+        # restore quads in pack-only mode
         if sharedProperties.packOnly:
             bpy.ops.object.mode_set(mode="EDIT")
             bpy.ops.mesh.select_all(action="DESELECT")
@@ -672,7 +619,6 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                 if hasattr(bm.edges, "ensure_lookup_table"):
                     bm.edges.ensure_lookup_table()
 
-                # assume that all the triangulated edges come after the original edges
                 newEdges = []
                 for edge in range(len(edgeList["edges"]), len(bm.edges)):
                     newEdge = bm.edges[edge]
@@ -687,17 +633,14 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
                 bm.free()
                 bpy.ops.object.mode_set(mode="EDIT")
 
-        # End setting the quads back again-------------------------------------------------------------
-
-        # select the original objects that were selected
+        # re-select the originally selected objects
         for objectName in rename_dict:
-            if objectName[0] in bpy.context.scene.objects:
-                current_object = bpy.context.scene.objects[objectName[0]]
+            if objectName in bpy.context.scene.objects:
+                current_object = bpy.context.scene.objects[objectName]
                 current_object.select_set(True)
                 context.view_layer.objects.active = current_object
 
         bpy.ops.object.mode_set(mode=startingMode)
-
         print("Finished Xatlas----------------------------------------")
         return {"FINISHED"}
 
@@ -742,12 +685,10 @@ class OBJECT_PT_pack_panel(Panel):
         layout = self.layout
         scene = context.scene
         packtool = scene.pack_tool
-        mytool = scene.chart_tool
 
-        # add the pack options
         box = layout.box()
-        # label = box.label(text="Pack Options")
-        for tool in packtool.__annotations__.keys():
+        # Use _prop_keys() — works with Python 3.13 deferred annotations
+        for tool in _prop_keys(packtool):
             box.prop(packtool, tool)
 
 
@@ -767,12 +708,11 @@ class OBJECT_PT_chart_panel(Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        packtool = scene.pack_tool
         mytool = scene.chart_tool
 
-        # add the chart options
         box = layout.box()
-        for tool in mytool.__annotations__.keys():
+        # Use _prop_keys() — works with Python 3.13 deferred annotations
+        for tool in _prop_keys(mytool):
             box.prop(mytool, tool)
 
 
@@ -792,11 +732,8 @@ class OBJECT_PT_run_panel(Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        packtool = scene.pack_tool
-        mytool = scene.chart_tool
 
         box = layout.box()
-        # label = box.label(text="Run")
         row = box.row()
         row.label(text="Unwrap")
         row.prop(scene.shared_properties, "unwrapSelection")
@@ -820,9 +757,6 @@ class OBJECT_PT_run_panel(Panel):
             box.prop(scene.shared_properties, "mainUVName")
         elif scene.shared_properties.mainUVChoiceType == "INDEX":
             box.prop(scene.shared_properties, "mainUVIndex")
-        # box.prop( scene.shared_properties, 'mainUVName')
-
-        # box.prop( scene.shared_properties, 'mainUVIndex')
 
         box = layout.box()
         row = box.row()
@@ -856,23 +790,17 @@ classes = (
 
 
 def register():
-    #
     for cls in classes:
         register_class(cls)
-    #
 
     bpy.types.Scene.pack_tool = PointerProperty(type=PG_PackProperties)
     bpy.types.Scene.chart_tool = PointerProperty(type=PG_ChartProperties)
     bpy.types.Scene.shared_properties = PointerProperty(type=PG_SharedProperties)
 
-    #
-
 
 def unregister():
-    #
     for cls in reversed(classes):
         unregister_class(cls)
-    #
 
     del bpy.types.Scene.shared_properties
     del bpy.types.Scene.chart_tool
