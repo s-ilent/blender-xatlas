@@ -474,7 +474,7 @@ class Unwrap_Lightmap_Group_Xatlas_2(bpy.types.Operator):
         bpy.ops.wm.obj_export(
             filepath=tmp_path,
             export_animation=False,
-            apply_modifiers=True,
+            apply_modifiers=False,  # must match obj.data topology, UVs are written back onto it
             export_eval_mode="DAG_EVAL_VIEWPORT",
             export_selected_objects=True,
             export_uv=True,
